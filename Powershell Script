@@ -1,0 +1,89 @@
+<#
+.SYNOPSIS
+Script designed to fix WinRe error for KB5034441
+
+.DESCRIPTION
+This script is designed to resolve the WinRE partition issue related to the KB5034441 update. It checks if WinRE is enabled, resizes the partition if necessary, and recreates the WinRE partition to fix the problem.
+
+.NOTES
+- Use this script at your own risk. The author and any contributors are not liable for any damage or data loss caused by running this script.
+- Carefully study the provided script before using it. Test in your non-production lab first.
+- Ensure that you have proper backups in place before running this script.
+- This script requires administrative privileges to run.
+- The script has been tested on Windows 10 systems, but it may work on other versions of Windows as well.
+- If you encounter any issues or have suggestions for improvement, please create an issue on the GitHub repository.
+- Script provided by Ghosxt (https://www.ghosxt.com)
+- Connect with the author on LinkedIn: https://www.linkedin.com/in/ulises-paiz/
+
+.LINK
+https://github.com/Coach40oz/Fix-WinRE-KB5034441
+
+.EXAMPLE
+.\FixWinREKB5034441.ps1
+
+#>
+
+function Get-WinREInfo {
+    [string]$nfo = reagentc /info
+    if ($nfo -match ".*Windows RE status:.*Enabled.*") {
+        # Verify if WINRE is enabled, if so proceed.
+        $nfo -match ".*Windows RE location.*harddisk(\d+)" | Out-Null
+        $disk = $Matches[1]
+        $nfo -match ".*Windows RE location.*partition(\d+)" | Out-Null
+        $partition = $Matches[1]
+        $resizable = ((Get-Disk -Number $disk | Get-Partition).PartitionNumber | Measure-Object -Maximum).Maximum -eq $partition
+        $currentSize = [string]((Get-Disk -Number $disk | Get-Partition | Where-Object PartitionNumber -eq $partition).Size / 1MB) + 'MB'
+        return New-Object -TypeName psobject -Property ([ordered]@{Enabled = 'True'; Disk = $disk; Partition = $partition; Resizable = $resizable; CurrentSize = $currentSize; A1_Key = [System.Guid]::NewGuid() })
+    }
+    else {
+        return New-Object -TypeName psobject -Property ([ordered]@{Enabled = 'False'; Disk = 'N/A'; Partition = 'N/A'; Resizable = 'N/A'; CurrentSize = 'N/A'; A1_Key = [System.Guid]::NewGuid() })
+    }
+}
+
+function Fix-WinREKB5034441 {
+    try {
+        # Gather data on if this can be done.
+        $winREInfo = Get-WinREInfo
+        if ($winREInfo.Enabled -eq 'True') {
+            $disk = $winREInfo.Disk
+            $partition = $winREInfo.Partition
+            $disk_type = $(Get-Disk | Select-Object Number, PartitionStyle | Where-Object { $_.Number -eq 0 }).PartitionStyle
+            
+            # Start building the script to pass to diskpart.
+            $Diskpart_Script = "sel disk $disk`n"
+            $Diskpart_Script += "sel partition $($partition - 1)`n"
+            $Diskpart_Script += "shrink desired=250 minimum=250`n"
+            $Diskpart_Script += "sel partition $partition`n"
+            $Diskpart_Script += "delete partition override`n"
+            
+            if ($disk_type -eq 'GPT') {
+                $Diskpart_Script += "create partition primary id=de94bba4-06d1-4d40-a16a-bfd50179d6ac`n"
+                $Diskpart_Script += "gpt attributes=0x8000000000000001`n"
+            }
+            else {
+                $Diskpart_Script += "create partition primary id=27`n"
+            }
+            
+            $Diskpart_Script += "format fs=ntfs label=`"Windows RE tools`" quick`n"
+            $Diskpart_Script | Out-File .\DiskScript.txt -Encoding ascii
+            
+            # Execute the script
+            reagentc /disable
+            diskpart /s .\DiskScript.txt
+            reagentc /enable
+            Remove-Item .\DiskScript.txt
+            
+            Write-Host "WinRE partition has been successfully resized and the issue should be resolved."
+        }
+        else {
+            Write-Host "WinRE is not enabled on this system. No action required."
+        }
+    }
+    catch {
+        Write-Host "An error occurred while trying to fix the WinRE partition:"
+        Write-Host $_.Exception.Message
+    }
+}
+
+# Run the script
+Fix-WinREKB5034441
