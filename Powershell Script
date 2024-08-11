@@ -1,89 +1,195 @@
 <#
 .SYNOPSIS
-Script designed to fix WinRe error for KB5034441
+Automates the fix for the KB5034441 issue related to Windows Recovery Environment (WinRE).
 
 .DESCRIPTION
-This script is designed to resolve the WinRE partition issue related to the KB5034441 update. It checks if WinRE is enabled, resizes the partition if necessary, and recreates the WinRE partition to fix the problem.
+This script checks the status of WinRE, resizes the partition if necessary, and applies the fix for the KB5034441 issue.
+It's designed to work on Windows systems and requires System account privileges when run through an RMM tool.
 
-.NOTES
-- Use this script at your own risk. The author and any contributors are not liable for any damage or data loss caused by running this script.
-- Carefully study the provided script before using it. Test in your non-production lab first.
-- Ensure that you have proper backups in place before running this script.
-- This script requires administrative privileges to run.
-- The script has been tested on Windows 10 systems, but it may work on other versions of Windows as well.
-- If you encounter any issues or have suggestions for improvement, please create an issue on the GitHub repository.
-- Script provided by Ghosxt (https://www.ghosxt.com)
-- Connect with the author on LinkedIn: https://www.linkedin.com/in/ulises-paiz/
-
-.LINK
-https://github.com/Coach40oz/Fix-WinRE-KB5034441
+.PARAMETER Force
+When set, forces the script to attempt the fix even if WinRE is not enabled or other checks fail.
 
 .EXAMPLE
-.\FixWinREKB5034441.ps1
+.\Fix-WinREKB5034441.ps1
+Runs the script with default settings, attempting to fix the WinRE partition if WinRE is enabled.
+
+.EXAMPLE
+.\Fix-WinREKB5034441.ps1 -Force
+Runs the script and attempts to fix the WinRE partition regardless of its current status.
+
+.NOTES
+Version: 1.5
+Author: Ulises Paiz
+Last Updated: August 10, 2024
+Requires: PowerShell 5.1 or later, System account privileges
+
+This script should be run with caution and only on systems affected by the KB5034441 issue.
+Always ensure you have a backup before making system changes.
+
+.LINK
+https://support.microsoft.com/en-us/topic/kb5034441-windows-recovery-environment-update-for-windows-10-version-21h2-and-22h2-cce871d2-8f4f-41d5-bdc7-9d832f731b71
 
 #>
 
+# Initialize variables
+$global:Force = $false
+$global:LogFile = "C:\Windows\Temp\WinRE_Fix_Log_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+
+# Function to write to log file
+function Write-Log {
+    param (
+        [string]$Message,
+        [string]$Severity = 'Info'
+    )
+
+    $TimeStamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $LogMessage = "[$TimeStamp] [$Severity] $Message"
+    
+    Add-Content -Path $global:LogFile -Value $LogMessage
+    Write-Output $LogMessage
+}
+
+function Test-SystemAccount {
+    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return $currentUser.IsSystem
+}
+
 function Get-WinREInfo {
-    [string]$nfo = reagentc /info
-    if ($nfo -match ".*Windows RE status:.*Enabled.*") {
-        # Verify if WINRE is enabled, if so proceed.
-        $nfo -match ".*Windows RE location.*harddisk(\d+)" | Out-Null
-        $disk = $Matches[1]
-        $nfo -match ".*Windows RE location.*partition(\d+)" | Out-Null
-        $partition = $Matches[1]
-        $resizable = ((Get-Disk -Number $disk | Get-Partition).PartitionNumber | Measure-Object -Maximum).Maximum -eq $partition
-        $currentSize = [string]((Get-Disk -Number $disk | Get-Partition | Where-Object PartitionNumber -eq $partition).Size / 1MB) + 'MB'
-        return New-Object -TypeName psobject -Property ([ordered]@{Enabled = 'True'; Disk = $disk; Partition = $partition; Resizable = $resizable; CurrentSize = $currentSize; A1_Key = [System.Guid]::NewGuid() })
+    try {
+        Write-Log "Retrieving WinRE information..." -Severity 'Info'
+        $nfo = reagentc /info
+        Write-Log "Raw WinRE info: $nfo" -Severity 'Info'
+        
+        if ($nfo -match ".*Windows RE status:.*Enabled.*") {
+            if ($nfo -notmatch ".*Windows RE location.*harddisk(\d+).*partition(\d+)") {
+                throw "Unable to parse WinRE location from reagentc output."
+            }
+            $disk = $Matches[1]
+            $partition = $Matches[2]
+            
+            Write-Log "Detected WinRE on disk $disk, partition $partition" -Severity 'Info'
+            
+            $diskInfo = Get-Disk -Number $disk -ErrorAction Stop
+            $partitionInfo = $diskInfo | Get-Partition -ErrorAction Stop
+            
+            $maxPartition = ($partitionInfo.PartitionNumber | Measure-Object -Maximum).Maximum
+            $resizable = $maxPartition -eq $partition
+            
+            $currentSize = ($partitionInfo | Where-Object PartitionNumber -eq $partition).Size / 1MB
+            $currentSizeString = "{0:N2} MB" -f $currentSize
+            
+            Write-Log "WinRE partition details - Resizable: $resizable, Current Size: $currentSizeString" -Severity 'Info'
+            
+            return @{
+                Enabled = $true
+                Disk = $disk
+                Partition = $partition
+                Resizable = $resizable
+                CurrentSize = $currentSizeString
+            }
+        }
+        else {
+            Write-Log "WinRE is not enabled on this system." -Severity 'Warning'
+            return @{
+                Enabled = $false
+                Disk = 'N/A'
+                Partition = 'N/A'
+                Resizable = $false
+                CurrentSize = 'N/A'
+            }
+        }
     }
-    else {
-        return New-Object -TypeName psobject -Property ([ordered]@{Enabled = 'False'; Disk = 'N/A'; Partition = 'N/A'; Resizable = 'N/A'; CurrentSize = 'N/A'; A1_Key = [System.Guid]::NewGuid() })
+    catch {
+        Write-Log "Error occurred while getting WinRE info: $_" -Severity 'Error'
+        Write-Log "Stack Trace: $($_.ScriptStackTrace)" -Severity 'Error'
+        throw
     }
 }
 
 function Fix-WinREKB5034441 {
     try {
-        # Gather data on if this can be done.
         $winREInfo = Get-WinREInfo
-        if ($winREInfo.Enabled -eq 'True') {
+        if ($winREInfo.Enabled -or $global:Force) {
             $disk = $winREInfo.Disk
             $partition = $winREInfo.Partition
-            $disk_type = $(Get-Disk | Select-Object Number, PartitionStyle | Where-Object { $_.Number -eq 0 }).PartitionStyle
             
-            # Start building the script to pass to diskpart.
-            $Diskpart_Script = "sel disk $disk`n"
-            $Diskpart_Script += "sel partition $($partition - 1)`n"
-            $Diskpart_Script += "shrink desired=250 minimum=250`n"
-            $Diskpart_Script += "sel partition $partition`n"
-            $Diskpart_Script += "delete partition override`n"
+            if ($disk -eq 'N/A' -or $partition -eq 'N/A') {
+                throw "Invalid disk or partition information. Cannot proceed with fix."
+            }
             
+            $disk_type = (Get-Disk -Number $disk -ErrorAction Stop).PartitionStyle
+            Write-Log "Disk $disk partition style: $disk_type" -Severity 'Info'
+
+            $Diskpart_Script = @(
+                "sel disk $disk",
+                "sel partition $($partition - 1)",
+                "shrink desired=250 minimum=250",
+                "sel partition $partition",
+                "delete partition override"
+            )
+
             if ($disk_type -eq 'GPT') {
-                $Diskpart_Script += "create partition primary id=de94bba4-06d1-4d40-a16a-bfd50179d6ac`n"
-                $Diskpart_Script += "gpt attributes=0x8000000000000001`n"
+                $Diskpart_Script += @(
+                    "create partition primary id=de94bba4-06d1-4d40-a16a-bfd50179d6ac",
+                    "gpt attributes=0x8000000000000001"
+                )
             }
             else {
-                $Diskpart_Script += "create partition primary id=27`n"
+                $Diskpart_Script += "create partition primary id=27"
             }
+
+            $Diskpart_Script += "format fs=ntfs label=`"Windows RE tools`" quick"
+            $DiskScriptPath = "C:\Windows\Temp\DiskScript.txt"
+            $Diskpart_Script | Out-File $DiskScriptPath -Encoding ascii
+
+            Write-Log "Disabling WinRE..." -Severity 'Info'
+            $disableOutput = reagentc /disable
+            Write-Log "Disable WinRE output: $disableOutput" -Severity 'Info'
             
-            $Diskpart_Script += "format fs=ntfs label=`"Windows RE tools`" quick`n"
-            $Diskpart_Script | Out-File .\DiskScript.txt -Encoding ascii
+            Write-Log "Executing diskpart script..." -Severity 'Info'
+            $diskpartOutput = diskpart /s $DiskScriptPath
+            Write-Log "Diskpart output: $diskpartOutput" -Severity 'Info'
             
-            # Execute the script
-            reagentc /disable
-            diskpart /s .\DiskScript.txt
-            reagentc /enable
-            Remove-Item .\DiskScript.txt
+            Write-Log "Enabling WinRE..." -Severity 'Info'
+            $enableOutput = reagentc /enable
+            Write-Log "Enable WinRE output: $enableOutput" -Severity 'Info'
             
-            Write-Host "WinRE partition has been successfully resized and the issue should be resolved."
+            Remove-Item $DiskScriptPath -ErrorAction SilentlyContinue
+
+            Write-Log "WinRE partition has been processed. Please check logs for details." -Severity 'Info'
         }
         else {
-            Write-Host "WinRE is not enabled on this system. No action required."
+            Write-Log "WinRE is not enabled on this system. No action required." -Severity 'Warning'
         }
     }
     catch {
-        Write-Host "An error occurred while trying to fix the WinRE partition:"
-        Write-Host $_.Exception.Message
+        Write-Log "An error occurred while trying to fix the WinRE partition: $_" -Severity 'Error'
+        Write-Log "Stack Trace: $($_.ScriptStackTrace)" -Severity 'Error'
+        throw
     }
 }
 
-# Run the script
-Fix-WinREKB5034441
+# Main script execution
+try {
+    if (-not (Test-SystemAccount)) {
+        throw "This script must be run under the System account. Current execution context is not suitable."
+    }
+
+    Write-Log "Starting WinRE fix script..." -Severity 'Info'
+    
+    if ($global:Force) {
+        Write-Log "Force flag is set. Proceeding with fix regardless of current WinRE status." -Severity 'Warning'
+    }
+
+    Fix-WinREKB5034441
+
+    Write-Log "Script execution completed. Please check logs for details." -Severity 'Info'
+}
+catch {
+    Write-Log "Script execution failed: $_" -Severity 'Error'
+    Write-Log "Stack Trace: $($_.ScriptStackTrace)" -Severity 'Error'
+    exit 1
+}
+finally {
+    Write-Log "Log file saved to: $global:LogFile" -Severity 'Info'
+}
